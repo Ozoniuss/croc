@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -630,7 +631,7 @@ func (c *Client) transferOverLocalRelay(errchan chan<- error) {
 		if bytes.Equal(data, handshakeRequest) {
 			break
 		} else if bytes.Equal(data, []byte{1}) {
-			log.Debug("got ping")
+			log.Debug("got ping from local relay")
 		} else {
 			log.Debugf("instead of handshake got: %s", data)
 		}
@@ -644,6 +645,7 @@ func (c *Client) transferOverLocalRelay(errchan chan<- error) {
 		c.Options.RelayPorts = []string{c.Options.RelayPorts[0]}
 	}
 	c.ExternalIP = ipaddr
+	log.Debug("start transfer via local relay")
 	errchan <- c.transfer()
 }
 
@@ -737,30 +739,39 @@ On the other computer run:
 			B, _ := pake.InitCurve([]byte(c.Options.SharedSecret[5:]), 1, c.Options.Curve)
 			for {
 				var dataMessage SimpleMessage
-				log.Trace("waiting for bytes")
-				data, errConn := conn.Receive()
-				if errConn != nil {
-					log.Tracef("[%+v] had error: %s", conn, errConn.Error())
+				log.Debug("waiting for bytes")
+				data, errRecv := conn.Receive()
+				if errRecv != nil {
+					// if errors.Is(errRecv, io.EOF) {
+					// 	log.Debugf("[%v] connection closed", conn)
+					// 	errchan <- errRecv
+					// 	return
+					// }
+					log.Debugf("[%+v] had error: %s %v", conn, errRecv.Error(), errors.Is(errRecv, io.EOF))
 				}
 				json.Unmarshal(data, &dataMessage)
-				log.Tracef("data: %+v '%s'", data, data)
-				log.Tracef("dataMessage: %s", dataMessage)
-				log.Tracef("kB: %x", kB)
+				log.Debugf("data: %+v '%s'", data, data)
+				log.Debugf("dataMessage: %s", dataMessage)
+				log.Debugf("kB: %x", kB)
 				// if kB not null, then use it to decrypt
 				if kB != nil {
 					var decryptErr error
 					var dataDecrypt []byte
 					dataDecrypt, decryptErr = crypt.Decrypt(data, kB)
 					if decryptErr != nil {
-						log.Tracef("error decrypting: %v: '%s'", decryptErr, data)
+						log.Debugf("error decrypting: %v: '%s'", decryptErr, data)
+						if strings.Contains(decryptErr.Error(), "message authentication failed") {
+							errchan <- decryptErr
+							return
+						}
 					} else {
 						// copy dataDecrypt to data
 						data = dataDecrypt
-						log.Tracef("decrypted: %s", data)
+						log.Debugf("decrypted: %s", data)
 					}
 				}
 				if bytes.Equal(data, ipRequest) {
-					log.Tracef("got ipRequest")
+					log.Debugf("got ipRequest")
 					// recipient wants to try to connect to local ips
 					var ips []string
 					// only get local ips if the local is enabled
@@ -768,31 +779,31 @@ On the other computer run:
 						// get list of local ips
 						ips, err = utils.GetLocalIPs()
 						if err != nil {
-							log.Tracef("error getting local ips: %v", err)
+							log.Debugf("error getting local ips: %v", err)
 						}
 						// prepend the port that is being listened to
 						ips = append([]string{c.Options.RelayPorts[0]}, ips...)
 					}
-					log.Tracef("sending ips: %+v", ips)
+					log.Debugf("sending ips: %+v", ips)
 					bips, errIps := json.Marshal(ips)
 					if errIps != nil {
-						log.Tracef("error marshalling ips: %v", errIps)
+						log.Debugf("error marshalling ips: %v", errIps)
 					}
 					bips, errIps = crypt.Encrypt(bips, kB)
 					if errIps != nil {
-						log.Tracef("error encrypting ips: %v", errIps)
+						log.Debugf("error encrypting ips: %v", errIps)
 					}
 					if err = conn.Send(bips); err != nil {
 						log.Errorf("error sending: %v", err)
 					}
 				} else if dataMessage.Kind == "pake1" {
-					log.Trace("got pake1")
+					log.Debug("got pake1")
 					var pakeError error
 					pakeError = B.Update(dataMessage.Bytes)
 					if pakeError == nil {
 						kB, pakeError = B.SessionKey()
 						if pakeError == nil {
-							log.Tracef("dataMessage kB: %x", kB)
+							log.Debugf("dataMessage kB: %x", kB)
 							dataMessage.Bytes = B.Bytes()
 							dataMessage.Kind = "pake2"
 							data, _ = json.Marshal(dataMessage)
@@ -803,13 +814,13 @@ On the other computer run:
 
 					}
 				} else if bytes.Equal(data, handshakeRequest) {
-					log.Trace("got handshake")
+					log.Debug("got handshake")
 					break
 				} else if bytes.Equal(data, []byte{1}) {
-					log.Trace("got ping")
+					log.Debug("got ping")
 					continue
 				} else {
-					log.Tracef("[%+v] got weird bytes: %+v", conn, data)
+					log.Debugf("[%v] got weird bytes: %+v", conn, data)
 					// throttle the reading
 					errchan <- fmt.Errorf("gracefully refusing using the public relay")
 					return
@@ -823,10 +834,35 @@ On the other computer run:
 				c.Options.RelayPorts = []string{c.Options.RelayPorts[0]}
 			}
 			c.ExternalIP = ipaddr
-			log.Debug("exchanged header message")
+			log.Debug("exchanged header message, starting transfer via nonlocal")
 			errchan <- c.transfer()
 		}()
 	}
+
+	// errsgot := 0
+	// var reterr error
+	// for errsgot < errcnt {
+	// 	select {
+	// 	case cerr := <-errchan:
+	// 		// options relay transfer successful
+	// 		if cerr == nil {
+	// 			return
+	// 		}
+	// 		log.Debugf("error from errchan: %v", cerr)
+	// 		reterr = errors.Join(reterr, cerr)
+	// 		errsgot += 1
+	// 	case cerr := <-errchanLocal:
+	// 		// local relay transfer successful
+	// 		if cerr == nil {
+	// 			return
+	// 		}
+	// 		log.Debugf("error from errchanLocal: %v", cerr)
+	// 		reterr = errors.Join(reterr, cerr)
+	// 		errsgot += 1
+	// 	}
+	// }
+
+	// return reterr
 
 	err = <-errchan
 	if err == nil {
@@ -837,9 +873,12 @@ On the other computer run:
 		if strings.Contains(err.Error(), "could not secure channel") {
 			return err
 		}
+		// if strings.Contains(err.Error(), "gracefully refusing using the public relay") {
+		// 	return err
+		// }
 	}
 	if !c.Options.DisableLocal {
-		if strings.Contains(err.Error(), "refusing files") || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "bad password") {
+		if strings.Contains(err.Error(), "refusing files") || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "bad password") || strings.Contains(err.Error(), "message authentication failed") {
 			errchan <- err
 		}
 		err = <-errchan
@@ -1085,6 +1124,7 @@ func (c *Client) Receive() (err error) {
 				banner = banner2
 				c.Options.RelayAddress = serverTry
 				c.ExternalIP = externalIP
+				// c.conn[0].Send([]byte("ce pula mea ai?"))
 				c.conn[0].Close()
 				c.conn[0] = nil
 				c.conn[0] = conn

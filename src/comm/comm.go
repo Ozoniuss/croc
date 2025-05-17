@@ -26,6 +26,13 @@ type Comm struct {
 	connection net.Conn
 }
 
+func (c *Comm) String() string {
+	if c.connection == nil {
+		return "nil connection"
+	}
+	return fmt.Sprintf("comm object [local:%v, remote:%v]", c.connection.LocalAddr(), c.connection.RemoteAddr())
+}
+
 // NewConnection gets a new comm to a tcp address
 func NewConnection(address string, timelimit ...time.Duration) (c *Comm, err error) {
 	tlimit := 30 * time.Second
